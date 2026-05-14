@@ -1,0 +1,72 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: logiflow
+  labels:
+    app: worker
+    version: "1.0.0"
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: worker
+  template:
+    metadata:
+      labels:
+        app: worker
+    spec:
+      serviceAccountName: worker
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: worker
+          image: amazon/aws-cli:latest
+          command:
+            - /bin/bash
+            - -c
+            - |
+              echo "Worker started. Consuming from queue: $SQS_QUEUE_URL"
+              while true; do
+                OUTPUT=$(aws sqs receive-message \
+                  --queue-url "$SQS_QUEUE_URL" \
+                  --max-number-of-messages 10 \
+                  --wait-time-seconds 20 \
+                  --region us-east-1 \
+                  --query "Messages[*].[Body,ReceiptHandle]" \
+                  --output text 2>/dev/null)
+                if [ -n "$OUTPUT" ]; then
+                  COUNT=$(echo "$OUTPUT" | wc -l | tr -d ' ')
+                  echo "Processing $COUNT messages"
+                  while IFS=$'\t' read -r BODY RECEIPT; do
+                    echo "  Processed: ${BODY:0:80}"
+                    aws sqs delete-message \
+                      --queue-url "$SQS_QUEUE_URL" \
+                      --receipt-handle "$RECEIPT" \
+                      --region us-east-1 > /dev/null 2>&1
+                  done <<< "$OUTPUT"
+                else
+                  echo "Queue empty, waiting..."
+                fi
+              done
+          env:
+            - name: SQS_QUEUE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: worker-config
+                  key: sqs_queue_url
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: worker-config
+  namespace: logiflow
+data:
+  sqs_queue_url: "https://sqs.us-east-1.amazonaws.com/686699774218/logiflow-shipments-gerald"
+  aws_region: "us-east-1"

@@ -1,0 +1,145 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sns-notifier-config
+  namespace: logiflow
+data:
+  sns_topic_arn: "arn:aws:sns:us-east-1:686699774218:logiflow-scaling-alerts-gerald"
+  aws_region: "us-east-1"
+  cluster_name: "logiflow-eks"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sns-notifier
+  namespace: logiflow
+  labels:
+    app: sns-notifier
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sns-notifier
+  template:
+    metadata:
+      labels:
+        app: sns-notifier
+    spec:
+      serviceAccountName: event-exporter
+      initContainers:
+        - name: install-boto3
+          image: python:3.11-slim
+          command: ["pip", "install", "boto3", "--target=/deps", "--quiet"]
+          volumeMounts:
+            - name: deps
+              mountPath: /deps
+      containers:
+        - name: notifier
+          image: python:3.11-slim
+          command:
+            - python3
+            - -c
+            - |
+              import sys
+              sys.path.insert(0, "/deps")
+              import json, os, boto3
+              from http.server import HTTPServer, BaseHTTPRequestHandler
+
+              TOPIC_ARN = os.environ["SNS_TOPIC_ARN"]
+              REGION    = os.environ.get("AWS_REGION", "us-east-1")
+              CLUSTER   = os.environ.get("CLUSTER_NAME", "unknown")
+
+              class NotifyHandler(BaseHTTPRequestHandler):
+                  def log_message(self, format, *args):
+                      print(f"[sns-notifier] {format % args}", flush=True)
+
+                  def do_POST(self):
+                      if self.path != "/notify":
+                          self.send_response(404); self.end_headers(); return
+                      length = int(self.headers.get("Content-Length", 0))
+                      body   = json.loads(self.rfile.read(length))
+                      reason    = body.get("reason", "unknown")
+                      ns        = body.get("involvedObject", {}).get("namespace", "?")
+                      name      = body.get("involvedObject", {}).get("name", "?")
+                      kind      = body.get("involvedObject", {}).get("kind", "?")
+                      message   = body.get("message", "")
+                      timestamp = body.get("lastTimestamp", "")
+                      subject   = f"[LogiFlow Alert] {reason} — {kind}/{name}"
+                      body_text = (
+                          f"Scaling event detected in your EKS cluster.\n\n"
+                          f"Cluster:   {CLUSTER}\n"
+                          f"Namespace: {ns}\n"
+                          f"Resource:  {kind}/{name}\n"
+                          f"Reason:    {reason}\n"
+                          f"Message:   {message}\n"
+                          f"Time:      {timestamp}\n\n"
+                          f"Check the cluster: kubectl get pods -n {ns}"
+                      )
+                      try:
+                          sns = boto3.client("sns", region_name=REGION)
+                          sns.publish(TopicArn=TOPIC_ARN, Subject=subject, Message=body_text)
+                          print(f"Alert sent: {subject}", flush=True)
+                          self.send_response(200)
+                      except Exception as e:
+                          print(f"SNS error: {e}", flush=True)
+                          self.send_response(500)
+                      self.end_headers()
+
+                  def do_GET(self):
+                      if self.path == "/health":
+                          self.send_response(200); self.end_headers()
+                          self.wfile.write(b'{"status":"ok"}')
+                      else:
+                          self.send_response(404); self.end_headers()
+
+              print("SNS notifier listening on :8080", flush=True)
+              HTTPServer(("0.0.0.0", 8080), NotifyHandler).serve_forever()
+          env:
+            - name: SNS_TOPIC_ARN
+              valueFrom:
+                configMapKeyRef:
+                  name: sns-notifier-config
+                  key: sns_topic_arn
+            - name: AWS_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: sns-notifier-config
+                  key: aws_region
+            - name: CLUSTER_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: sns-notifier-config
+                  key: cluster_name
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "256Mi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: deps
+              mountPath: /deps
+      volumes:
+        - name: deps
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sns-notifier
+  namespace: logiflow
+spec:
+  selector:
+    app: sns-notifier
+  ports:
+    - port: 8080
+      targetPort: 8080

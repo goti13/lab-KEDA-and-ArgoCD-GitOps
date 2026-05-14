@@ -1,0 +1,31 @@
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: worker-sqs-auth
+  namespace: logiflow
+spec:
+  podIdentity:
+    provider: aws
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: worker
+  namespace: logiflow
+spec:
+  scaleTargetRef:
+    name: worker
+  minReplicaCount: 0
+  maxReplicaCount: 10
+  cooldownPeriod: 300
+  pollingInterval: 15
+  triggers:
+    - type: aws-sqs-queue
+      authenticationRef:
+        name: worker-sqs-auth
+      metadata:
+        queueURL: "https://sqs.us-east-1.amazonaws.com/686699774218/logiflow-shipments-gerald"
+        awsRegion: "us-east-1"
+        awsAccountID: "686699774218"
+        queueLength: "10"
+        scaleOnInFlight: "true"
